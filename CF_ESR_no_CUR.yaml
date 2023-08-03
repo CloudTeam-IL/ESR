@@ -1,0 +1,672 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Use only us-east-1!! The CF will create lambda role and rule to view your ESR and CW dashboard if you have no CUR"
+
+Parameters:
+
+  BucketName:
+    Default: "Enter your bucket name that will store the query output"
+    Description: "Enter your bucket name that will store the query output"
+    Type: String
+
+
+  CustomerName:
+    Default: "Enter Customer Name"
+    Description: "Enter Customer Name"
+    AllowedPattern: '^[0-9a-z-/]*$'
+    Type: String
+
+Resources:
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub
+        - '${CustomerName}-cloudteam-cur-bucket'
+        - CustomerName: !Ref CustomerName
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: 2008-10-17
+        Id: Policy1335892530063
+        Statement:
+          - Sid: Stmt1335892150622
+            Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - 's3:GetBucketAcl'
+              - 's3:GetBucketPolicy'
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Sub
+                  - '${CustomerName}-cloudteam-cur-bucket'
+                  - CustomerName: !Ref CustomerName
+            Condition:
+              StringEquals:
+                'aws:SourceArn': !Join
+                  - ':'
+                  - - 'arn:aws:cur:us-east-1'
+                    - !Ref 'AWS::AccountId'
+                    - definition/*
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: Stmt1335892526596
+            Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - 's3:PutObject'
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Sub
+                  - '${CustomerName}-cloudteam-cur-bucket'
+                  - CustomerName: !Ref CustomerName
+                - /*
+            Condition:
+              StringEquals:
+                'aws:SourceArn': !Join
+                  - ':'
+                  - - 'arn:aws:cur:us-east-1'
+                    - !Ref 'AWS::AccountId'
+                    - definition/*
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+    DependsOn: S3Bucket
+
+  CUR:
+    Type: 'AWS::CUR::ReportDefinition'
+    Properties:
+      AdditionalArtifacts:
+        - ATHENA
+      AdditionalSchemaElements:
+        - RESOURCES
+      Compression: Parquet
+      Format: Parquet
+      RefreshClosedReports: 'True'
+      ReportName: !Sub
+        - '${CustomerName}-CLOUDTEAM-CUR'
+        - CustomerName: !Ref CustomerName
+      ReportVersioning: OVERWRITE_REPORT
+      S3Bucket: !Ref S3Bucket
+      S3Prefix: cur
+      S3Region: us-east-1
+      TimeUnit: HOURLY
+    DependsOn: S3Bucket
+
+  AWSCURCrawlerComponentFunction:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: AWSCURCrawlerComponentFunction
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'glue:UpdateDatabase'
+                  - 'glue:UpdatePartition'
+                  - 'glue:CreateTable'
+                  - 'glue:UpdateTable'
+                  - 'glue:ImportCatalogToGlue'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource: !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref S3Bucket
+                    - /cur/
+                    - !Ref CUR
+                    - /*
+        - PolicyName: AWSCURKMSDecryption
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                Resource: '*'
+    DependsOn: S3Bucket
+
+  AWSCURDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      DatabaseInput:
+        Name: cloudteam_cur_database
+      CatalogId: !Ref 'AWS::AccountId'
+
+  AWSCURCrawlerLambdaExecutor:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AWSCURCrawlerLambdaExecutor
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'''
+              - Effect: Allow
+                Action:
+                  - 'glue:StartCrawler'
+                  - 'glue:PutResourcePolicy'
+                Resource: '*'
+
+  AWSCURCrawler:
+    Type: 'AWS::Glue::Crawler'
+    DependsOn:
+      - AWSCURDatabase
+      - AWSCURCrawlerComponentFunction
+    Properties:
+      Name: cloudteam_cur_crawler
+      Description: A recurring crawler that keeps your CUR table in Athena up-to-date.
+      Role: !GetAtt
+        - AWSCURCrawlerComponentFunction
+        - Arn
+      DatabaseName: !Ref AWSCURDatabase
+      Targets:
+        S3Targets:
+          - Path: !Join
+              - /
+              - - 's3:/'
+                - !Ref S3Bucket
+                - cur
+                - !Ref CUR
+            Exclusions:
+              - '**.json'
+              - '**.yml'
+              - '**.sql'
+              - '**.csv'
+              - '**.gz'
+              - '**.zip'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DELETE_FROM_DATABASE
+
+  AWSCURInitializer:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: AWSCURCrawler
+    Properties:
+      Code:
+        ZipFile: >
+          const AWS = require('aws-sdk');
+          const response = require('./cfn-response');
+          exports.handler = function(event, context, callback) {
+            if (event.RequestType === 'Delete') {
+              response.send(event, context, response.SUCCESS);
+            } else {
+              const glue = new AWS.Glue();
+              glue.startCrawler({ Name: 'AWSCURCrawler-cur-to-CLOUDTEAM2' }, function(err, data) {
+                if (err) {
+                  const responseData = JSON.parse(this.httpResponse.body);
+                  if (responseData['__type'] == 'CrawlerRunningException') {
+                    callback(null, responseData.Message);
+                  } else {
+                    const responseString = JSON.stringify(responseData);
+                    if (event.ResponseURL) {
+                      response.send(event, context, response.FAILED,{ msg: responseString });
+                    } else {
+                      callback(responseString);
+                    }
+                  }
+                }
+                else {
+                  if (event.ResponseURL) {
+                    response.send(event, context, response.SUCCESS);
+                  } else {
+                    callback(null, response.SUCCESS);
+                  }
+                }
+              });
+            }
+          };
+      Handler: 'index.handler'
+      Timeout: 30
+      Runtime: nodejs16.x
+      #      ReservedConcurrentExecutions: 1
+      Role: !GetAtt AWSCURCrawlerLambdaExecutor.Arn
+
+  AWSStartCURCrawler:
+    Type: 'Custom::AWSStartCURCrawler'
+    Properties:
+      ServiceToken: !GetAtt
+        - AWSCURInitializer
+        - Arn
+
+  AWSS3CUREventLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt
+        - AWSCURInitializer
+        - Arn
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !GetAtt
+        - S3Bucket
+        - Arn
+    DependsOn: S3Bucket
+
+  AWSS3CURLambdaExecutor:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AWSS3CURLambdaExecutor
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'''
+              - Effect: Allow
+                Action:
+                  - 's3:PutBucketNotification'
+                Resource: !GetAtt
+                  - S3Bucket
+                  - Arn
+    DependsOn: S3Bucket
+
+  AWSS3CURNotification:
+    Type: 'AWS::Lambda::Function'
+    DependsOn:
+      - AWSCURInitializer
+      - AWSS3CUREventLambdaPermission
+      - AWSS3CURLambdaExecutor
+    Properties:
+      Code:
+        ZipFile: >
+          const AWS = require('aws-sdk');
+          const response = require('./cfn-response');
+          exports.handler = function(event, context, callback) {
+            const s3 = new AWS.S3();
+            const putConfigRequest = function(notificationConfiguration) {
+              return new Promise(function(resolve, reject) {
+                s3.putBucketNotificationConfiguration({
+                  Bucket: event.ResourceProperties.BucketName,
+                  NotificationConfiguration: notificationConfiguration
+                }, function(err, data) {
+                  if (err) reject({ msg: this.httpResponse.body.toString(), error: err, data: data });
+                  else resolve(data);
+                });
+              });
+            };
+            const newNotificationConfig = {};
+            if (event.RequestType !== 'Delete') {
+              newNotificationConfig.LambdaFunctionConfigurations = [{
+                Events: [ 's3:ObjectCreated:*' ],
+                LambdaFunctionArn: event.ResourceProperties.TargetLambdaArn || 'missing arn',
+                Filter: { Key: { FilterRules: [ { Name: 'prefix', Value: event.ResourceProperties.ReportKey } ] } }
+              }];
+            }
+            putConfigRequest(newNotificationConfig).then(function(result) {
+              response.send(event, context, response.SUCCESS, result);
+              callback(null, result);
+            }).catch(function(error) {
+              response.send(event, context, response.FAILED, error);
+              console.log(error);
+              callback(error);
+            });
+          };
+      Handler: 'index.handler'
+      Timeout: 30
+      Runtime: nodejs16.x
+      #      ReservedConcurrentExecutions: 1
+      Role: !GetAtt AWSS3CURLambdaExecutor.Arn
+
+  AWSPutS3CURNotification:
+    Type: 'Custom::AWSPutS3CURNotification'
+    Properties:
+      ServiceToken: !GetAtt
+        - AWSS3CURNotification
+        - Arn
+      TargetLambdaArn: !GetAtt
+        - AWSCURInitializer
+        - Arn
+      BucketName: !Ref S3Bucket
+      ReportKey: !Sub
+        - 'cur/${CustomerName}-CLOUDTEAM-CUR/${CustomerName}-CLOUDTEAM-CUR'
+        - CustomerName: !Ref CustomerName
+    DependsOn: S3Bucket
+
+  AWSCURReportStatusTable:
+    Type: 'AWS::Glue::Table'
+    DependsOn: AWSCURDatabase
+    Properties:
+      DatabaseName: cloudteam_cur_status_table
+      CatalogId: !Ref 'AWS::AccountId'
+      TableInput:
+        Name: cost_and_usage_data_status
+        TableType: EXTERNAL_TABLE
+        StorageDescriptor:
+          Columns:
+            - Name: status
+              Type: string
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Location: !Join
+            - /
+            - - 's3:/'
+              - !Ref S3Bucket
+              - cur
+              - !Ref CUR
+              - cost_and_usage_data_status/
+
+  # ESR
+  FunctionGetEsrMetric:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role:
+        'Fn::GetAtt':
+          - EsrRole
+          - Arn
+      FunctionName: cloudteam_get_esr_metric
+      Code:
+        ZipFile: |
+          import time
+          import boto3
+          import os
+          import datetime
+          from datetime import timedelta
+
+          bucket_name = os.environ['bucket_name']
+          query_database = os.environ['query_database']
+          query_table = os.environ['query_table']
+          days_ago = os.environ['days_ago']
+
+          query = """SELECT
+          1 - (SUM(CASE WHEN (lower(product_capacitystatus) = 'used' AND lower(line_item_product_code) = 'amazonec2') THEN "amortized_cost" ELSE 0 END) / SUM(CASE WHEN (lower(product_capacitystatus) = 'used' AND lower(line_item_product_code) = 'amazonec2') THEN "pricing_public_on_demand_cost" ELSE 0 END)) as "ESR"
+          FROM (
+          select *, (CASE WHEN ((line_item_line_item_type IN ('DiscountedUsage', 'Usage', 'SavingsPlanCoveredUsage', 'SavingsPlanNegation', 'SavingsPlanRecurringFee', 'SavingsPlanUpfrontFee', 'RIFee', 'Fee')) AND (line_item_usage_type <> 'Route53-Domains')) THEN (CASE WHEN (line_item_line_item_type = 'SavingsPlanCoveredUsage') THEN savings_plan_savings_plan_effective_cost WHEN (line_item_line_item_type = 'SavingsPlanRecurringFee') THEN (savings_plan_total_commitment_to_date - savings_plan_used_commitment) WHEN (line_item_line_item_type IN ('SavingsPlanUpfrontFee', 'SavingsPlanNegation')) THEN 0 WHEN (line_item_line_item_type = 'DiscountedUsage') THEN reservation_effective_cost WHEN (line_item_line_item_type = 'RIFee') THEN (reservation_unused_amortized_upfront_fee_for_billing_period + reservation_unused_recurring_fee) WHEN (reservation_start_time <> '') THEN 0 ELSE line_item_unblended_cost END) ELSE 0 END) "amortized_cost"
+          FROM "{Query_Database}"."{Query_Table}")
+          WHERE
+                line_item_usage_start_date >= now() - INTERVAL '{Days_Ago}' day""".format(Query_Database=query_database,
+                                                                                          Query_Table=query_table,
+                                                                                          Days_Ago=days_ago)
+
+
+          def esr_value_to_float(esr_value):
+              esr_value_str = esr_value.strip().strip('"')
+              esr_value_float = float(esr_value_str)
+              return esr_value_float
+
+
+          def start_athena_query():
+              # Run query in Athena
+              athena_client = boto3.client('athena')
+              # Execution
+              response = athena_client.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={
+                      'Database': query_database
+                  },
+                  ResultConfiguration={
+                      'OutputLocation': f's3://{bucket_name}'
+                  },
+                  WorkGroup='primary'
+              )
+              print(f'response: {response}')
+              # S3 file name uses the QueryExecutionId so
+              # grab it here so we can pull the S3 file.
+              qeid = response["QueryExecutionId"]
+
+              # occasionally the Athena hasn't written the file
+              # before the lambda tries to pull it out of S3, so pause a few seconds
+              # Note:  You are charged for time the lambda is running.
+              # A more elegant but more complicated solution would try to get the
+              # file first then sleep.
+              time.sleep(5)
+              return qeid
+
+
+          def get_query_result(qeid):
+              ###### Get query result from S3.
+              s3 = boto3.client('s3')
+              objectkey = qeid + ".csv"
+              # load object as file
+              file_content = s3.get_object(
+                  Bucket=bucket_name,
+                  Key=objectkey)["Body"].read()
+
+              # split file on carriage returns
+              lines = file_content.decode().splitlines()
+              return lines[-1]
+
+
+          def get_date_x_days_ago(days_ago):
+              # Get the current date
+              current_date = datetime.datetime.now()
+              # Calculate the date two weeks ago
+              x_days_ago = current_date - timedelta(days=int(days_ago))
+              print(x_days_ago)
+              return x_days_ago
+              # # Format the date as a string (optional)
+              # formatted_date = two_weeks_ago.strftime("%Y-%m-%d")
+
+
+          def post_result_to_cw(esr_value_float):
+              # post query results as a CloudWatch metric
+              x_days_ago = get_date_x_days_ago(days_ago)
+              cloudwatch = boto3.client('cloudwatch')
+              response = cloudwatch.put_metric_data(
+                  MetricData=[
+                      {
+                          'MetricName': 'ESR_metric',
+                          'Dimensions': [
+                              {
+                                  'Name': 'ESR',
+                                  'Value': 'ESR'
+                              },
+                          ],
+                          'Timestamp': x_days_ago,
+                          'Unit': 'Percent',
+                          'Value': esr_value_float * 100
+                      },
+                  ],
+                  Namespace='ESR_metric'
+              )
+              return response
+
+
+          def lambda_handler(event, context):
+              qeid = start_athena_query()
+              esr_value = get_query_result(qeid)
+              esr_value_float = esr_value_to_float(esr_value)
+              response = post_result_to_cw(esr_value_float)
+
+              return response
+
+      Environment:
+        Variables:
+          bucket_name: !Ref BucketName
+          query_database: cloudteam_cur_status_table
+          query_table: cost_and_usage_data_status
+          days_ago: 2
+      Runtime: python3.9
+      Timeout: 60
+
+  EsrRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: ESR_Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AWSLambdaBasicExecutionRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+        - PolicyName: EsrPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                  - 'athena:*'
+                  - 'cloudwatch:*'
+                  - 'glue:GetTable'
+                  - 'glue:GetPartitions'
+                Resource: '*'
+
+  GetEsrMetricCronRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: GetEsrMetricCronRule
+      Description: Lambda trigger every day at 10:00 am
+      ScheduleExpression:
+        cron(0 7 * * ? *)
+      Targets:
+        - Id: DeleteUnattachedVolumesScheduleTarget
+          Arn:
+            'Fn::GetAtt':
+              - FunctionGetEsrMetric
+              - Arn
+      State: ENABLED
+
+  CwEsrDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardBody: '{
+        "widgets": [
+          {
+            "height": 7,
+            "width": 13,
+            "y": 5,
+            "x": 0,
+            "type": "metric",
+            "properties": {
+              "sparkline": true,
+              "view": "gauge",
+              "stacked": false,
+              "metrics": [
+                [ "ESR_metric", "ESR_metric", "ESR", "ESR", { "region": "us-east-1" } ]
+              ],
+              "region": "us-east-1",
+              "title": "ESR",
+              "period": 300,
+              "start": "-PT336H",
+              "yAxis": {
+                "left": {
+                  "min": 0,
+                  "max": 100
+                }
+              },
+              "end": "P0D"
+            }
+          },
+          {
+            "height": 3,
+            "width": 13,
+            "y": 12,
+            "x": 0,
+            "type": "text",
+            "properties": {
+              "markdown": "# CloudTeam \nCloudteam is a leading FinOps operation, offering a unique end-to-end model that maps, analyzes, and optimizes your cloud costs while delivering significant ongoing savings\n\nJoin us  [button:https:cloudteam.ai](https://cloudteam.ai/about-us/) "
+            }
+          },
+          {
+            "height": 5,
+            "width": 24,
+            "y": 0,
+            "x": 0,
+            "type": "text",
+            "properties": {
+              "markdown": "# What is ESR? \n\nEffective Savings Rate (ESR) is a simple, single metric that always reflects your actual savings rate. \n\nESR represents the percentage discount you receive with RIs and Savings Plans across your entire compute fleet when all is said and done. With resources coming and going, and savings instruments being bought, modified, exchanged, and expiring, each with differing discount rates, across multiple AWS accounts, it’s non-trivial to understand your actual savings rate. That’s what ESR does—it’s the ultimate savings truth-teller.\n\nThere are 2 main input metrics available today to help you understand your use of savings instruments utilization and coverage. However, none of these metrics answer the fundamental question of “what is my overall savings rate?”. ESR, which measures the blended discount percentage you’re receiving off the on-demand price across your global compute spend, ties every input metric together and provides a single measure of savings performance which is independent of spend levels "
+            }
+          },
+          {
+            "height": 7,
+            "width": 11,
+            "y": 5,
+            "x": 13,
+            "type": "metric",
+            "properties": {
+              "view": "timeSeries",
+              "stacked": false,
+              "metrics": [
+                [ "ESR_metric", "ESR_metric", "ESR", "ESR", { "region": "us-east-1" } ]
+              ],
+              "region": "us-east-1",
+              "start": "-PT336H",
+              "period": 300,
+              "end": "P0D"
+            }
+          }
+        ]
+      }'
+      DashboardName: 'Cloudteam_ESR_Dashboard'
+
+Outputs:
+  CloudteamOutputs:
+    Description: Go to CloudWatch dashboard to see the results.
+    Value: !Ref CwEsrDashboard
+    Export:
+      Name: Dashboard
