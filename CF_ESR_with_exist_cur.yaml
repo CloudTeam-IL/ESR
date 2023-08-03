@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Use N.Virginia (us-east-1) in order to create the cloudwatch dashboard!! The CF will create lambda role and rule to view your ESR and CW dashboard if you already have CUR"
+
+Parameters:
+
+  BucketName:
+    Default: "Enter your bucket name that will store the query output"
+    Description: "Enter your bucket name that will store the query output"
+    Type: String
+
+  QueryDatabase:
+    Default: "Enter database name where you store the CUR"
+    Description: "Enter database name where you store the CUR"
+    Type: String
+
+  QueryTable:
+    Default: "Enter table in database where you store the CUR"
+    Description: "Enter table in database where you store the CUR"
+    Type: String
+
+
+Resources:
+
+  FunctionGetEsrMetric:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role:
+        'Fn::GetAtt':
+          - EsrRole
+          - Arn
+      FunctionName: cloudteam_get_esr_metric88
+      Code:
+        ZipFile: |
+          import time
+          import boto3
+          import os
+          import datetime
+          from datetime import timedelta
+          import cfnresponse
+          
+          bucket_name = os.environ['bucket_name']
+          query_database = os.environ['query_database']
+          query_table = os.environ['query_table']
+          days_ago = os.environ['days_ago']
+          
+          
+          def esr_value_to_float(esr_value):
+              esr_value_str = esr_value.strip().strip('"')
+              esr_value_float = float(esr_value_str)
+              return esr_value_float
+          
+          
+          def start_athena_query(x_days_ago):
+              query = """SELECT
+              1 - (SUM(CASE WHEN (lower(product_capacitystatus) = 'used' AND lower(line_item_product_code) = 'amazonec2') THEN "amortized_cost" ELSE 0 END) / SUM(CASE WHEN (lower(product_capacitystatus) = 'used' AND lower(line_item_product_code) = 'amazonec2') THEN "pricing_public_on_demand_cost" ELSE 0 END)) as "ESR"
+              FROM (
+              select *, (CASE WHEN ((line_item_line_item_type IN ('DiscountedUsage', 'Usage', 'SavingsPlanCoveredUsage', 'SavingsPlanNegation', 'SavingsPlanRecurringFee', 'SavingsPlanUpfrontFee', 'RIFee', 'Fee')) AND (line_item_usage_type <> 'Route53-Domains')) THEN (CASE WHEN (line_item_line_item_type = 'SavingsPlanCoveredUsage') THEN savings_plan_savings_plan_effective_cost WHEN (line_item_line_item_type = 'SavingsPlanRecurringFee') THEN (savings_plan_total_commitment_to_date - savings_plan_used_commitment) WHEN (line_item_line_item_type IN ('SavingsPlanUpfrontFee', 'SavingsPlanNegation')) THEN 0 WHEN (line_item_line_item_type = 'DiscountedUsage') THEN reservation_effective_cost WHEN (line_item_line_item_type = 'RIFee') THEN (reservation_unused_amortized_upfront_fee_for_billing_period + reservation_unused_recurring_fee) WHEN (reservation_start_time <> '') THEN 0 ELSE line_item_unblended_cost END) ELSE 0 END) "amortized_cost"
+              FROM "{Query_Database}"."{Query_Table}") 
+              WHERE
+                    line_item_usage_start_date >= now() - INTERVAL '{Days_Ago}' day""".format(Query_Database=query_database,
+                                                                                              Query_Table=query_table,
+                                                                                              Days_Ago=x_days_ago)
+              # Run query in Athena
+              athena_client = boto3.client('athena')
+              # Execution
+              response = athena_client.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={
+                      'Database': query_database
+                  },
+                  ResultConfiguration={
+                      'OutputLocation': f's3://{bucket_name}'
+                  },
+                  WorkGroup='primary'
+              )
+              print(f'response: {response}')
+              # S3 file name uses the QueryExecutionId so
+              # grab it here so we can pull the S3 file.
+              qeid = response["QueryExecutionId"]
+          
+              # occasionally the Athena hasn't written the file
+              # before the lambda tries to pull it out of S3, so pause a few seconds
+              # Note:  You are charged for time the lambda is running.
+              # A more elegant but more complicated solution would try to get the
+              # file first then sleep.
+              time.sleep(5)
+              return qeid
+          
+          
+          def get_query_result(qeid):
+              ###### Get query result from S3.
+              s3 = boto3.client('s3')
+              objectkey = qeid + ".csv"
+              # load object as file
+              file_content = s3.get_object(
+                  Bucket=bucket_name,
+                  Key=objectkey)["Body"].read()
+          
+              # split file on carriage returns
+              lines = file_content.decode().splitlines()
+              # return ESR value
+              return lines[-1]
+          
+          
+          def get_date_x_days_ago(days_ago):
+              # Get the current date
+              current_date = datetime.datetime.now()
+              # Calculate the date two weeks ago
+              x_days_ago = current_date - timedelta(days=int(days_ago))
+              print(x_days_ago)
+              return x_days_ago
+          
+          
+          def post_result_to_cw(esr_value_float, x_days_ago):
+              # post query results as a CloudWatch metric
+              cloudwatch = boto3.client('cloudwatch')
+              response = cloudwatch.put_metric_data(
+                  MetricData=[
+                      {
+                          'MetricName': 'ESR_metric',
+                          'Dimensions': [
+                              {
+                                  'Name': 'ESR',
+                                  'Value': 'ESR'
+                              },
+                          ],
+                          'Timestamp': x_days_ago,
+                          'Unit': 'Percent',
+                          'Value': esr_value_float * 100
+                      },
+                  ],
+                  Namespace='ESR_metric'
+              )
+              return response
+          
+          def get_esr_values_past_2_weeks(list_days):
+              # Use CF list properties pass by custom resource
+              for x_days_ago in list_days:
+                  print(f'Check ESR {x_days_ago} days ago')
+                  qeid = start_athena_query(x_days_ago)
+                  esr_value = get_query_result(qeid)
+                  esr_value_float = esr_value_to_float(esr_value)
+                  print(f'esr_value:{esr_value_float}')
+                  x_days_ago_timestamp = get_date_x_days_ago(x_days_ago)
+                  post_result_to_cw(esr_value_float, x_days_ago_timestamp)
+          
+          
+          def get_esr_values_2_days_ago():
+              # Use lambda environment variables
+              print(f'Check ESR {days_ago} days ago')
+              qeid = start_athena_query(days_ago)
+              esr_value = get_query_result(qeid)
+              esr_value_float = esr_value_to_float(esr_value)
+              print(f'esr_value:{esr_value_float}')
+              x_days_ago_timestamp = get_date_x_days_ago(days_ago)
+              post_result_to_cw(esr_value_float, x_days_ago_timestamp)
+          
+          
+          def lambda_handler(event, context):
+              try:
+                  event['ResourceProperties']['list_days']
+                  list_days = event['ResourceProperties']['list_days']
+                  get_esr_values_past_2_weeks(list_days)
+                  # Return response to custom resource
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except:
+                  # Use lambda environment variables
+                  get_esr_values_2_days_ago()
+
+      Environment:
+        Variables:
+          bucket_name: !Ref BucketName
+          query_database: !Ref QueryDatabase
+          query_table: !Ref QueryTable
+          days_ago: 2
+      Runtime: python3.9
+      Timeout: 60
+
+  EsrRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: CloudteamESRRole88
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AWSLambdaBasicExecutionRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+        - PolicyName: EsrPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                  - 'athena:*'
+                  - 'cloudwatch:*'
+                  - 'glue:GetTable'
+                  - 'glue:GetPartitions'
+                Resource: '*'
+
+  GetEsrMetricCronRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: CloudteamGetEsrMetricCronRule88
+      Description: Lambda trigger every day at 10:00 am
+      ScheduleExpression:
+        cron(0 7 * * ? *)
+      Targets:
+        - Id: DeleteUnattachedVolumesScheduleTarget
+          Arn:
+            'Fn::GetAtt':
+              - FunctionGetEsrMetric
+              - Arn
+      State: ENABLED
+
+  CwEsrDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardBody: '{
+        "widgets": [
+          {
+            "height": 7,
+            "width": 13,
+            "y": 5,
+            "x": 0,
+            "type": "metric",
+            "properties": {
+              "sparkline": true,
+              "view": "gauge",
+              "stacked": false,
+              "metrics": [
+                [ "ESR_metric", "ESR_metric", "ESR", "ESR", { "region": "us-east-1" } ]
+              ],
+              "region": "us-east-1",
+              "title": "ESR",
+              "period": 300,
+              "start": "-PT336H",
+              "yAxis": {
+                "left": {
+                  "min": 0,
+                  "max": 100
+                }
+              },
+              "end": "P0D"
+            }
+          },
+          {
+            "height": 3,
+            "width": 13,
+            "y": 12,
+            "x": 0,
+            "type": "text",
+            "properties": {
+              "markdown": "# CloudTeam \nCloudteam is a leading FinOps operation, offering a unique end-to-end model that maps, analyzes, and optimizes your cloud costs while delivering significant ongoing savings\n\nJoin us  [button:https:cloudteam.ai](https://cloudteam.ai/about-us/) "
+            }
+          },
+          {
+            "height": 5,
+            "width": 24,
+            "y": 0,
+            "x": 0,
+            "type": "text",
+            "properties": {
+              "markdown": "# What is ESR? \n\nEffective Savings Rate (ESR) is a simple, single metric that always reflects your actual savings rate. \n\nESR represents the percentage discount you receive with RIs and Savings Plans across your entire compute fleet when all is said and done. With resources coming and going, and savings instruments being bought, modified, exchanged, and expiring, each with differing discount rates, across multiple AWS accounts, it’s non-trivial to understand your actual savings rate. That’s what ESR does—it’s the ultimate savings truth-teller.\n\nThere are 2 main input metrics available today to help you understand your use of savings instruments utilization and coverage. However, none of these metrics answer the fundamental question of “what is my overall savings rate?”. ESR, which measures the blended discount percentage you’re receiving off the on-demand price across your global compute spend, ties every input metric together and provides a single measure of savings performance which is independent of spend levels "
+            }
+          },
+          {
+            "height": 7,
+            "width": 11,
+            "y": 5,
+            "x": 13,
+            "type": "metric",
+            "properties": {
+              "view": "timeSeries",
+              "stacked": false,
+              "metrics": [
+                [ "ESR_metric", "ESR_metric", "ESR", "ESR", { "region": "us-east-1" } ]
+              ],
+              "region": "us-east-1",
+              "start": "-PT336H",
+              "period": 300,
+              "end": "P0D"
+            }
+          }
+        ]
+      }'
+      DashboardName: 'Cloudteam_ESR_Dashboard88'
+
+  InvokeLambda:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt FunctionGetEsrMetric.Arn
+      list_days: [13,7,2] # Pass the parameters of days ago
+
+Outputs:
+  CloudteamOutputs:
+    Description: Go to CloudWatch dashboard to see the results.
+    Value: !Ref CwEsrDashboard
+    Export:
+      Name: Dashboard
